@@ -30,6 +30,17 @@ def inject_inner(line: str, inner: typing.Optional[int]) -> str:
     return new_line
 
 
+def inject_hspthresh(line: str, hspthresh: typing.Optional[int]) -> str:
+    if hspthresh is None or " --hspthresh=" in line:
+        return line
+
+    new_line, count = re.subn(r"( --gappedthresh=\d+)", rf"\1 --hspthresh={hspthresh}", line, count=1)
+    if count == 0:
+        sys.exit(f"Unable to inject --hspthresh into unexpected lastz command: {line}")
+
+    return new_line
+
+
 class LastzCommands:
     def __init__(self) -> None:
         self.commands: dict[str, LastzCommand] = {}
@@ -48,7 +59,7 @@ class LastzCommands:
 
 
 class LastzCommand:
-    lastz_command_regex = re.compile(r"lastz (.+?)?ref\.2bit\[nameparse=darkspace\]\[multiple\]\[subset=ref_block(\d+)\.name\] (.+?)?query\.2bit\[nameparse=darkspace\]\[subset=query_block(\d+)\.name] --format=(\S+) --ydrop=(\d+) --gappedthresh=(\d+) --strand=(minus|plus)(?: --inner=(\d+))?(?: --ambiguous=(\S+))?(?: --(notrivial))?(?: --scores=(\S+))? --segments=tmp(\d+)\.block(\d+)\.r(\d+)\.(minus|plus)(?:\.split(\d+))?\.segments --output=tmp(\d+)\.block(\d+)\.r(\d+)\.(minus|plus)(?:\.split(\d+))?\.(\S+) 2> tmp(\d+)\.block(\d+)\.r(\d+)\.(minus|plus)(?:\.split(\d+))?\.err")
+    lastz_command_regex = re.compile(r"lastz (.+?)?ref\.2bit\[nameparse=darkspace\]\[multiple\]\[subset=ref_block(\d+)\.name\] (.+?)?query\.2bit\[nameparse=darkspace\]\[subset=query_block(\d+)\.name] --format=(\S+) --ydrop=(\d+) --gappedthresh=(\d+)(?: --hspthresh=(\d+))? --strand=(minus|plus)(?: --inner=(\d+))?(?: --ambiguous=(\S+))?(?: --(notrivial))?(?: --scores=(\S+))? --segments=tmp(\d+)\.block(\d+)\.r(\d+)\.(minus|plus)(?:\.split(\d+))?\.segments --output=tmp(\d+)\.block(\d+)\.r(\d+)\.(minus|plus)(?:\.split(\d+))?\.(\S+) 2> tmp(\d+)\.block(\d+)\.r(\d+)\.(minus|plus)(?:\.split(\d+))?\.err")
 
     def __init__(self, line: str) -> None:
         self.line = line
@@ -61,6 +72,7 @@ class LastzCommand:
         self.output_format: str = ''
         self.ydrop: int = 0
         self.gappedthresh: int = 0
+        self.hspthresh: int | None = None
         self.inner: int | None = None
         self.strand: int | None = None
         self.ambiguous: bool = False
@@ -83,7 +95,7 @@ class LastzCommand:
         self.output_format = match.group(5)
         self.ydrop = int(match.group(6))
         self.gappedthresh = int(match.group(7))
-        strand = match.group(8)
+        strand = match.group(9)
 
         if strand == 'plus':
             self.strand = 0
@@ -100,33 +112,39 @@ class LastzCommand:
             f"--format={self.output_format}",
             f"--ydrop={self.ydrop}",
             f"--gappedthresh={self.gappedthresh}",
-            f"--strand={strand}"
         ]
 
-        inner = match.group(9)
+        hspthresh = match.group(8)
+        if hspthresh is not None:
+            self.hspthresh = int(hspthresh)
+            self.args.append(f"--hspthresh={self.hspthresh}")
+
+        self.args.append(f"--strand={strand}")
+
+        inner = match.group(10)
         if inner is not None:
             self.inner = int(inner)
             self.args.append(f"--inner={self.inner}")
 
-        ambiguous = match.group(10)
+        ambiguous = match.group(11)
         if ambiguous is not None:
             self.ambiguous = True
             self.args.append(f"--ambiguous={ambiguous}")
 
-        nontrivial = match.group(11)
+        nontrivial = match.group(12)
         if nontrivial is not None:
             self.nontrivial = True
             self.args.append("--nontrivial")
 
-        scoring = match.group(12)
+        scoring = match.group(13)
         if scoring is not None:
             self.scoring = scoring
             self.args.append(f"--scoring={scoring}")
 
-        tmp_no = int(match.group(13))
-        block_no = int(match.group(14))
-        r_no = int(match.group(15))
-        split = match.group(17)
+        tmp_no = int(match.group(14))
+        block_no = int(match.group(15))
+        r_no = int(match.group(16))
+        split = match.group(18)
 
         base_filename = f"tmp{tmp_no}.block{block_no}.r{r_no}.{strand}"
 
@@ -401,7 +419,7 @@ def run_kegalign(args: argparse.Namespace, num_sentinel: int, kegalign_args: lis
 
     # use the currently existing output file if it exists
     if args.debug:
-        skip_kegalign = load_kegalign_output("lastz-commands.txt", args.inner, kegalign_q)
+        skip_kegalign = load_kegalign_output("lastz-commands.txt", args.inner, args.hspthresh, kegalign_q)
 
     if not skip_kegalign:
         run_args = ["kegalign"]
@@ -425,6 +443,7 @@ def run_kegalign(args: argparse.Namespace, num_sentinel: int, kegalign_args: lis
 
         for line in process.stdout.splitlines():
             line = inject_inner(line, args.inner)
+            line = inject_hspthresh(line, args.hspthresh)
             commands.add(line)
             kegalign_q.put(line)
 
@@ -442,7 +461,7 @@ def run_kegalign(args: argparse.Namespace, num_sentinel: int, kegalign_args: lis
     return skip_kegalign
 
 
-def load_kegalign_output(filename: str, inner: typing.Optional[int], kegalign_q: queue.Queue[str]) -> bool:
+def load_kegalign_output(filename: str, inner: typing.Optional[int], hspthresh: typing.Optional[int], kegalign_q: queue.Queue[str]) -> bool:
     load_success = False
 
     r_beg = resource.getrusage(resource.RUSAGE_SELF)
@@ -453,6 +472,7 @@ def load_kegalign_output(filename: str, inner: typing.Optional[int], kegalign_q:
             for line in f:
                 line = line.rstrip("\n")
                 line = inject_inner(line, inner)
+                line = inject_hspthresh(line, hspthresh)
                 kegalign_q.put(line)
         load_success = True
     except FileNotFoundError:
@@ -478,6 +498,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--nogapped", action="store_true", help="don't perform gapped extension stage")
     parser.add_argument("--markend", action="store_true", help="write a marker line just before completion")
     parser.add_argument("--inner", type=int, help="pass --inner to LASTZ command generation and execution")
+    parser.add_argument("--hspthresh", type=int, help="pass --hspthresh to KegAlign and to LASTZ command generation and execution")
     parser.add_argument("--num-gpu", default=-1, type=int, help="number of GPUs to use (default: %(default)s [use all GPUs])")
     parser.add_argument("--num-cpu", default=-1, type=int, help="number of CPUs to use (default: %(default)s [use all CPUs])")
     parser.add_argument("--debug", action="store_true", help="print debug messages")
@@ -503,6 +524,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
     if args.num_gpu != -1:
         kegalign_args.extend(["--num_gpu", f"{args.num_gpu}"])
+
+    # --hspthresh is consumed above so it can be injected into the generated
+    # LASTZ commands; re-forward it so KegAlign's seeding stage still gets it
+    if args.hspthresh is not None:
+        kegalign_args.extend(["--hspthresh", f"{args.hspthresh}"])
 
     if args.debug:
         kegalign_args.append("--debug")
